@@ -357,12 +357,22 @@ function fromIterator(arr) {
   }
 }
 
+function top(stack) {
+  return stack[stack.length-1];
+}
+
+const sourcemapStack = [];
+const poppedStack = [];
+
 module.exports = {
   Frame: Frame,
   makeMacro: makeMacro,
   makeKeywordArgs: makeKeywordArgs,
   numArgs: numArgs,
   suppressValue: suppressValue,
+  top: top,
+  sourcemapStack: sourcemapStack,
+  poppedStack: poppedStack,
   ensureDefined: ensureDefined,
   memberLookup: memberLookup,
   contextOrFrameLookup: contextOrFrameLookup,

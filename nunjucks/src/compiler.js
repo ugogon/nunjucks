@@ -48,11 +48,15 @@ class Compiler extends Obj {
     this.bufferStack.push(this.buffer);
     this.buffer = id;
     this._emit(`var ${this.buffer} = "";`);
+    this._emit(`sourcemapStack.push([]);`);
     return id;
   }
 
-  _popBuffer() {
+  _popBuffer(silent=false) {
     this.buffer = this.bufferStack.pop();
+    if (!silent) {
+      this._emit(`poppedStack.push(sourcemapStack.pop());`);
+    }
   }
 
   _emit(code) {
@@ -74,12 +78,17 @@ class Compiler extends Obj {
     this._emitLine(`var lineno = ${node.lineno};`);
     this._emitLine(`var colno = ${node.colno};`);
     this._emitLine(`var ${this.buffer} = "";`);
+    this._emitLine('var sourcemapStack = runtime.sourcemapStack;');
+    this._emitLine('var poppedStack = runtime.poppedStack;');
+    this._emitLine(`sourcemapStack.push([]);`);
     this._emitLine('try {');
   }
 
   _emitFuncEnd(noReturn) {
     if (!noReturn) {
-      this._emitLine('cb(null, ' + this.buffer + ');');
+      this._emitLine(`${this.buffer} = new String(${this.buffer});`);
+      this._emitLine(`${this.buffer}.sourcemap = sourcemapStack.pop();`);
+      this._emitLine(`cb(null, ${this.buffer});`);
     }
 
     this._closeScopeLevels();
@@ -894,9 +903,9 @@ class Compiler extends Obj {
     });
 
     this._emitLine('frame = ' + ((keepFrame) ? 'frame.pop();' : 'callerFrame;'));
+    this._popBuffer();
     this._emitLine(`return new runtime.SafeString(${bufferId});`);
     this._emitLine('});');
-    this._popBuffer();
 
     return funcId;
   }
@@ -1015,7 +1024,16 @@ class Compiler extends Obj {
       this._emit(')');
     }
     this._emitLine('(env, context, frame, runtime, ' + this._makeCallback(id));
+    this._emitLine(`runtime.top(sourcemapStack).push({ start: ${this.buffer}.length });`)
     this._emitLine(`${this.buffer} += ${id};`);
+    this._emitLine(`if (${id} !== undefined && ${id}.length > 0) {`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).end = ${this.buffer}.length;`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapTo = [${node.lineno}, ${node.colno}];`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapToTemplate = ${this._templateName()};`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).children = ${id}.sourcemap;`);
+    this._emitLine(`} else {`);
+    this._emitLine(`runtime.top(sourcemapStack).pop();`)
+    this._emitLine(`}`);
     this._addScopeLevel();
   }
 
@@ -1064,7 +1082,12 @@ class Compiler extends Obj {
 
     this._emitLine('tasks.push(');
     this._emitLine('function(result, callback){');
+    this._emitLine(`runtime.top(sourcemapStack).push({ start: ${this.buffer}.length });`)
     this._emitLine(`${this.buffer} += result;`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).end = ${this.buffer}.length;`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapTo = [${node.lineno}, ${node.colno}];`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapToTemplate = ${this._templateName()};`);
+    this._emitLine(`runtime.top(runtime.top(sourcemapStack)).children = result.sourcemap;`);
     this._emitLine('callback(null);');
     this._emitLine('});');
     this._emitLine('env.waterfall(tasks, function(){');
@@ -1081,11 +1104,15 @@ class Compiler extends Obj {
     var buffer = this.buffer;
     this.buffer = 'output';
     this._emitLine('(function() {');
-    this._emitLine('var output = "";');
+    this._pushBuffer();
+    this._emitLine(`var ${this.buffer} = "";`);
     this._withScopedSyntax(() => {
       this.compile(node.body, frame);
     });
-    this._emitLine('return output;');
+    this._emitLine(`var output = new String(${this.buffer});`);
+    this._popBuffer(true);
+    this._emitLine(`output.sourcemap = sourcemapStack.pop();`);
+    this._emitLine(`return output;`);
     this._emitLine('})()');
     // and of course, revert back to the old buffer id
     this.buffer = buffer;
@@ -1093,16 +1120,22 @@ class Compiler extends Obj {
 
   compileOutput(node, frame) {
     const children = node.children;
+    // Should always only be one child
     children.forEach(child => {
       // TemplateData is a special case because it is never
       // autoescaped, so simply output it for optimization
       if (child instanceof nodes.TemplateData) {
         if (child.value) {
+          this._emitLine(`runtime.top(sourcemapStack).push({ start: ${this.buffer}.length });`)
           this._emit(`${this.buffer} += `);
           this.compileLiteral(child, frame);
           this._emitLine(';');
+          this._emitLine(`runtime.top(runtime.top(sourcemapStack)).end = ${this.buffer}.length;`);
+          this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapTo = [${child.lineno}, ${child.colno}, ${child.value.toString().length}];`);
+          this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapToTemplate = ${this._templateName()};`);
         }
       } else {
+        this._emitLine(`runtime.top(sourcemapStack).push({ start: ${this.buffer}.length });`)
         this._emit(`${this.buffer} += runtime.suppressValue(`);
         if (this.throwOnUndefined) {
           this._emit('runtime.ensureDefined(');
@@ -1112,6 +1145,11 @@ class Compiler extends Obj {
           this._emit(`,${node.lineno},${node.colno})`);
         }
         this._emit(', env.opts.autoescape);\n');
+        this._emitLine(`runtime.top(runtime.top(sourcemapStack)).end = ${this.buffer}.length;`);
+        this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapTo = [${child.lineno}, ${child.colno}];`);
+        this._emitLine(`runtime.top(runtime.top(sourcemapStack)).mapToTemplate = ${this._templateName()};`);
+        this._emitLine(`while (poppedStack.length > 0) { runtime.top(runtime.top(sourcemapStack)).children || (runtime.top(runtime.top(sourcemapStack)).children = []);
+          runtime.top(runtime.top(sourcemapStack)).children.push(poppedStack.pop());}`);
       }
     });
   }
@@ -1122,13 +1160,16 @@ class Compiler extends Obj {
     }
 
     frame = new Frame();
-
+    // console.dir(node, { depth: null });
+    // console.dir(frame, { depth: null });
     this._emitFuncBegin(node, 'root');
     this._emitLine('var parentTemplate = null;');
     this._compileChildren(node, frame);
     this._emitLine('if(parentTemplate) {');
     this._emitLine('parentTemplate.rootRenderFunc(env, context, frame, runtime, cb);');
     this._emitLine('} else {');
+    this._emitLine(`${this.buffer} = new String(${this.buffer});`);
+    this._emitLine(`${this.buffer}.sourcemap = sourcemapStack.pop();`);
     this._emitLine(`cb(null, ${this.buffer});`);
     this._emitLine('}');
     this._emitFuncEnd(true);
